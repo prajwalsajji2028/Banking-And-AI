@@ -1,0 +1,451 @@
+import React, { useState, useEffect } from 'react';
+import { UploadCloud, PieChart, Table as TableIcon, BarChart2, Info, List } from 'lucide-react';
+
+// --- Utility Functions ---
+
+// Robust CSV Line Parser to handle quotes and commas inside fields
+const parseCSVLine = (text) => {
+  let ret = [], keep = false, item = '';
+  for (let i = 0; i < text.length; i++) {
+    let c = text[i];
+    if (c === '"') keep = !keep;
+    else if (c === ',' && !keep) { ret.push(item.trim()); item = ''; }
+    else item += c;
+  }
+  ret.push(item.trim());
+  return ret;
+};
+
+// Utility to dynamically load SheetJS for Excel files
+const loadXlsxScript = () => {
+  return new Promise((resolve, reject) => {
+    if (window.XLSX) return resolve(window.XLSX);
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    script.onload = () => resolve(window.XLSX);
+    script.onerror = () => reject(new Error("Failed to load Excel parsing library"));
+    document.head.appendChild(script);
+  });
+};
+
+const CATEGORY_LABELS = ['Critical', 'Balanced', 'Healthy'];
+const CATEGORY_COLORS = ['#ef4444', '#f59e0b', '#10b981']; // Red, Amber, Green
+
+// K-Means Clustering Algorithm (Lloyd's Algorithm)
+const runKMeans = (data, features, maxIters = 100) => {
+  const k = 3; // Fixed to 3 for Critical, Balanced, Healthy categories
+  if (!data || data.length === 0 || features.length === 0) return null;
+
+  // 1. Extract and Impute Data (Mean Imputation for '-')
+  let matrix = data.map(row => features.map(f => {
+    let val = parseFloat(row[f]);
+    return isNaN(val) ? null : val;
+  }));
+
+  let colMeans = [];
+  for (let j = 0; j < features.length; j++) {
+    let sum = 0, count = 0;
+    for (let i = 0; i < matrix.length; i++) {
+      if (matrix[i][j] !== null) { sum += matrix[i][j]; count++; }
+    }
+    colMeans[j] = count === 0 ? 0 : sum / count;
+  }
+  
+  for (let i = 0; i < matrix.length; i++) {
+    for (let j = 0; j < features.length; j++) {
+      if (matrix[i][j] === null) matrix[i][j] = colMeans[j];
+    }
+  }
+
+  // 2. Normalize Data (Z-Score) to prevent large scale features from dominating
+  let colStds = [];
+  for (let j = 0; j < features.length; j++) {
+    let sumSq = 0;
+    for (let i = 0; i < matrix.length; i++) {
+      sumSq += Math.pow(matrix[i][j] - colMeans[j], 2);
+    }
+    let std = Math.sqrt(sumSq / matrix.length);
+    colStds[j] = std === 0 ? 1 : std;
+  }
+
+  let normMatrix = matrix.map(row => row.map((val, j) => (val - colMeans[j]) / colStds[j]));
+
+  // 3. Initialize Centroids (Random Forgy Method)
+  let centroids = [];
+  let indices = new Set();
+  while (centroids.length < k && centroids.length < normMatrix.length) {
+    let idx = Math.floor(Math.random() * normMatrix.length);
+    if (!indices.has(idx)) {
+      indices.add(idx);
+      centroids.push([...normMatrix[idx]]);
+    }
+  }
+
+  // 4. Iterate
+  let assignments = new Array(normMatrix.length).fill(-1);
+  let changed = true;
+  let iterations = 0;
+
+  while (changed && iterations < maxIters) {
+    changed = false;
+    iterations++;
+
+    // Assign to closest centroid
+    for (let i = 0; i < normMatrix.length; i++) {
+      let minDist = Infinity;
+      let bestCluster = -1;
+      for (let c = 0; c < k; c++) {
+        let dist = 0;
+        for (let j = 0; j < features.length; j++) {
+          dist += Math.pow(normMatrix[i][j] - centroids[c][j], 2);
+        }
+        if (dist < minDist) {
+          minDist = dist;
+          bestCluster = c;
+        }
+      }
+      if (assignments[i] !== bestCluster) {
+        assignments[i] = bestCluster;
+        changed = true;
+      }
+    }
+
+    // Update Centroids
+    let newCentroids = Array.from({length: k}, () => new Array(features.length).fill(0));
+    let counts = new Array(k).fill(0);
+
+    for (let i = 0; i < normMatrix.length; i++) {
+      let c = assignments[i];
+      counts[c]++;
+      for (let j = 0; j < features.length; j++) {
+        newCentroids[c][j] += normMatrix[i][j];
+      }
+    }
+
+    for (let c = 0; c < k; c++) {
+      if (counts[c] > 0) {
+        for (let j = 0; j < features.length; j++) {
+          centroids[c][j] = newCentroids[c][j] / counts[c];
+        }
+      }
+    }
+  }
+
+  // 5. Rank Clusters into Critical (0), Balanced (1), Healthy (2)
+  let rankFeatureIdx = features.findIndex(f => 
+    f.toLowerCase().includes('return on assets') || 
+    f.toLowerCase().includes('return on equity') || 
+    f.toLowerCase().includes('operating profit')
+  );
+  if (rankFeatureIdx === -1) rankFeatureIdx = 0; // Fallback to first feature
+
+  // Score based on the normalized centroid value of the rank feature
+  let clusterScores = centroids.map((c, i) => ({ id: i, score: c[rankFeatureIdx] }));
+  clusterScores.sort((a, b) => a.score - b.score);
+
+  let idMap = {};
+  clusterScores.forEach((cs, newRank) => {
+    idMap[cs.id] = newRank;
+  });
+
+  // Remap assignments based on rank
+  let rankedAssignments = assignments.map(a => idMap[a]);
+
+  // 6. Build Enriched Data Output
+  const enrichedData = data.map((row, i) => {
+    let newRow = { ...row, Cluster: rankedAssignments[i] };
+    features.forEach((f, j) => {
+      newRow[f] = matrix[i][j]; // Use imputed values for cleaner UI
+    });
+    return newRow;
+  });
+
+  // Calculate cluster stats
+  const clusterStats = Array.from({length: k}, (_, i) => ({
+    id: i,
+    label: CATEGORY_LABELS[i],
+    color: CATEGORY_COLORS[i],
+    count: rankedAssignments.filter(a => a === i).length
+  }));
+
+  return { 
+    data: enrichedData, 
+    stats: clusterStats, 
+    iterations,
+    rankFeature: features[rankFeatureIdx] 
+  };
+};
+
+// --- Main Application ---
+
+export default function App() {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  
+  const [rawData, setRawData] = useState([]);
+  const [features, setFeatures] = useState([]);
+  const [selectedFeatures, setSelectedFeatures] = useState([]);
+  
+  const [modelResult, setModelResult] = useState(null);
+
+  const handleFileUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      let linesArray = [];
+      let headerIdx = -1;
+
+      // Helper to try SheetJS parsing
+      const extractWithSheetJS = async () => {
+        const XLSX = await loadXlsxScript();
+        const arrayBuffer = await file.arrayBuffer();
+        const workbook = XLSX.read(arrayBuffer, { type: 'array' });
+        const firstSheet = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[firstSheet];
+        return XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' });
+      };
+
+      // Handle both CSV and Excel formats
+      if (file.name.toLowerCase().match(/\.xlsx?$/)) {
+        linesArray = await extractWithSheetJS();
+      } else {
+        const text = await file.text();
+        linesArray = text.split(/\r?\n/).filter(l => l.trim()).map(parseCSVLine);
+      }
+
+      // Robust header search function
+      const findHeader = (lines) => {
+        for (let i = 0; i < Math.min(lines.length, 50); i++) {
+          if (!Array.isArray(lines[i])) continue;
+          const rowStr = lines[i].map(c => String(c || '')).join(' ').toLowerCase();
+          if (rowStr.includes('year') && rowStr.includes('bank')) {
+            return i;
+          }
+        }
+        return -1;
+      };
+
+      headerIdx = findHeader(linesArray);
+
+      if (headerIdx === -1 && file.name.toLowerCase().endsWith('.csv')) {
+        console.warn("CSV native parse failed to find headers. Trying SheetJS fallback...");
+        try {
+          linesArray = await extractWithSheetJS();
+          headerIdx = findHeader(linesArray);
+        } catch (fallbackErr) {
+          console.warn("SheetJS fallback failed.", fallbackErr);
+        }
+      }
+
+      if (headerIdx === -1) {
+        const previewStr = linesArray.slice(0, 3)
+          .map(r => Array.isArray(r) ? r.join(', ') : String(r))
+          .join(' | ')
+          .substring(0, 100);
+        throw new Error(`Could not find header row containing 'Year' and 'Bank'. Preview: ${previewStr}...`);
+      }
+
+      const headers = linesArray[headerIdx].map(h => String(h || '').trim());
+      const yearIdx = headers.findIndex(h => h.toLowerCase().includes('year'));
+      const bankIdx = headers.findIndex(h => h.toLowerCase().includes('bank'));
+      
+      if (yearIdx === -1 || bankIdx === -1) {
+        throw new Error("Found header row but could not specifically isolate 'Year' and 'Bank' columns.");
+      }
+      
+      const featureNames = headers.filter((h, idx) => idx !== yearIdx && idx !== bankIdx && h !== "");
+
+      let parsedData = [];
+      let currentYear = "Unknown";
+
+      for (let i = headerIdx + 1; i < linesArray.length; i++) {
+        const cols = linesArray[i];
+        if (!Array.isArray(cols) || cols.length < 3) continue;
+
+        let yearVal = cols[yearIdx] !== undefined ? String(cols[yearIdx]).trim() : "";
+        let bankVal = cols[bankIdx] !== undefined ? String(cols[bankIdx]).trim() : "";
+
+        if (yearVal && yearVal !== "" && yearVal !== "-") currentYear = yearVal;
+
+        if (bankVal && bankVal !== "" && bankVal !== "-") {
+          let rowObj = { Year: currentYear, Bank: bankVal };
+          featureNames.forEach(f => {
+            const fIdx = headers.indexOf(f);
+            let val = cols[fIdx] !== undefined ? String(cols[fIdx]).trim() : "";
+            if (val) val = val.replace(/,/g, '');
+            rowObj[f] = val;
+          });
+          parsedData.push(rowObj);
+        }
+      }
+
+      if (parsedData.length === 0) throw new Error("No data rows successfully parsed.");
+
+      setRawData(parsedData);
+      setFeatures(featureNames);
+      setSelectedFeatures(featureNames); 
+      
+    } catch (err) {
+      console.error(err);
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (rawData.length > 0 && selectedFeatures.length > 0) {
+      const result = runKMeans(rawData, selectedFeatures);
+      setModelResult(result);
+    }
+  }, [rawData, selectedFeatures]);
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-800 font-sans">
+      <header className="bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between sticky top-0 z-20">
+        <div className="flex items-center space-x-3">
+          <div className="bg-indigo-600 p-2 rounded-lg">
+            <BarChart2 className="w-6 h-6 text-white" />
+          </div>
+          <div>
+            <h1 className="text-xl font-bold text-slate-900 leading-tight">Bank Categorization</h1>
+            <p className="text-xs text-slate-500">Automated Financial Health Grouping</p>
+          </div>
+        </div>
+        
+        <div className="relative">
+          <input 
+            type="file" 
+            accept=".csv, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel" 
+            onChange={handleFileUpload} 
+            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+            id="file-upload"
+          />
+          <button className="bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 px-4 py-2 rounded-md shadow-sm font-medium text-sm flex items-center transition-colors">
+            <UploadCloud className="w-4 h-4 mr-2" />
+            {rawData.length > 0 ? 'Upload New File' : 'Upload CSV / XLSX'}
+          </button>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto p-6 grid grid-cols-1 lg:grid-cols-4 gap-6">
+        
+        {/* Left Sidebar: Summary */}
+        <div className="lg:col-span-1 space-y-6">
+          <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+             <div className="bg-indigo-50 text-indigo-800 text-sm p-4 rounded-md border border-indigo-100 mb-6 flex items-start">
+               <Info className="w-5 h-5 mr-3 flex-shrink-0 mt-0.5" />
+               <p>Banks have been grouped into <b>3 Categories</b> automatically based on their key indicators and sorted for your review.</p>
+             </div>
+
+             {modelResult && (
+              <div>
+                <h2 className="text-sm font-bold text-slate-800 uppercase tracking-wider mb-4 flex items-center">
+                  <PieChart className="w-4 h-4 mr-2 text-slate-400" /> Categorization Summary
+                </h2>
+                <div className="space-y-3">
+                  {modelResult.stats.map(stat => (
+                    <div key={stat.id} className="flex items-center justify-between text-sm">
+                      <div className="flex items-center">
+                        <div className="w-3 h-3 rounded-full mr-2" style={{backgroundColor: stat.color}}></div>
+                        <span className="text-slate-600 font-medium">{stat.label}</span>
+                      </div>
+                      <span className="bg-slate-100 text-slate-800 py-1 px-2 rounded-md font-semibold text-xs">
+                        {stat.count} banks
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-5 text-xs text-slate-500 pt-4 border-t border-slate-100">
+                  Primary grouping indicator:<br/>
+                  <span className="font-semibold text-slate-700 mt-1 block">{modelResult.rankFeature}</span>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Right Content: Grouped Tables */}
+        <div className="lg:col-span-3 space-y-6">
+          
+          {error && (
+            <div className="bg-red-50 border border-red-200 text-red-700 p-4 rounded-lg flex items-start">
+              <Info className="w-5 h-5 mr-3 mt-0.5 flex-shrink-0" />
+              <div>
+                <h3 className="font-semibold">Error processing data</h3>
+                <p className="text-sm">{error}</p>
+              </div>
+            </div>
+          )}
+
+          {!rawData.length && !loading && !error && (
+            <div className="bg-white border-2 border-dashed border-slate-300 rounded-2xl flex flex-col items-center justify-center p-16 text-center h-96">
+              <div className="bg-indigo-50 p-4 rounded-full mb-4">
+                <List className="w-10 h-10 text-indigo-500" />
+              </div>
+              <h2 className="text-xl font-bold text-slate-800 mb-2">Awaiting Dataset</h2>
+              <p className="text-slate-500 max-w-md">
+                Please upload the "11.Select Ratios of Scheduled Commercial Banks" CSV or XLSX file to view the categorized lists.
+              </p>
+            </div>
+          )}
+
+          {loading && (
+            <div className="flex justify-center items-center h-64">
+              <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-indigo-600"></div>
+            </div>
+          )}
+
+          {modelResult && !loading && (
+            <div className="space-y-6">
+              {CATEGORY_LABELS.map((label, clusterId) => {
+                const banksInCluster = modelResult.data.filter(d => d.Cluster === clusterId);
+                
+                if (banksInCluster.length === 0) return null;
+
+                return (
+                  <div key={label} className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                    <div className="bg-slate-50 px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+                      <h3 className="font-bold text-lg flex items-center" style={{ color: CATEGORY_COLORS[clusterId] }}>
+                        {label} Banks
+                      </h3>
+                      <span className="bg-white px-3 py-1 rounded-full text-sm font-semibold border border-slate-200 shadow-sm text-slate-700">
+                        {banksInCluster.length} Entries
+                      </span>
+                    </div>
+                    <div className="overflow-x-auto max-h-[400px]">
+                      <table className="w-full text-left border-collapse text-sm">
+                        <thead className="bg-white text-slate-600 sticky top-0 z-10 shadow-sm border-b border-slate-200">
+                          <tr>
+                            <th className="px-6 py-3 font-semibold w-1/2">Bank Name</th>
+                            <th className="px-6 py-3 font-semibold w-1/4">Year</th>
+                            <th className="px-6 py-3 font-semibold w-1/4">{modelResult.rankFeature} Score</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {banksInCluster.map((row, idx) => (
+                            <tr key={idx} className="hover:bg-slate-50 transition-colors">
+                              <td className="px-6 py-3 font-medium text-slate-800">{row.Bank}</td>
+                              <td className="px-6 py-3 text-slate-500">{row.Year}</td>
+                              <td className="px-6 py-3 text-slate-600 font-mono">
+                                {Number(row[modelResult.rankFeature]).toFixed(2)}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}
