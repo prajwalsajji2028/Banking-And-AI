@@ -1,3 +1,5 @@
+Testing out github so made this post of my old project where i test AI models only (no real working content)
+
 In this application, the categorization happens in a two-step process, combining machine learning with a specific business rule.
 
 Here is exactly how the criteria works:
